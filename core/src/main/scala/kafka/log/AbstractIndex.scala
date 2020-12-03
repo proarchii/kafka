@@ -18,9 +18,9 @@
 package kafka.log
 
 import java.io.{File, RandomAccessFile}
-import java.nio.{ByteBuffer, MappedByteBuffer}
 import java.nio.channels.FileChannel
 import java.nio.file.Files
+import java.nio.{ByteBuffer, MappedByteBuffer}
 import java.util.concurrent.locks.{Lock, ReentrantLock}
 
 import kafka.log.IndexSearchType.IndexSearchEntity
@@ -111,9 +111,12 @@ abstract class AbstractIndex[K, V](@volatile var file: File, val baseOffset: Lon
    * @return a boolean indicating whether the size of the memory map and the underneath file is changed or not.
    */
   def resize(newSize: Int): Boolean = {
+    resize(newSize, false);
+  }
+
+  private def resize(newSize: Int, keepUnmaped: Boolean): Boolean = {
     inLock(lock) {
       val roundedNewSize = roundDownToExactMultiple(newSize, entrySize)
-
       if (_length == roundedNewSize) {
         false
       } else {
@@ -126,9 +129,13 @@ abstract class AbstractIndex[K, V](@volatile var file: File, val baseOffset: Lon
             safeForceUnmap()
           raf.setLength(roundedNewSize)
           _length = roundedNewSize
-          mmap = raf.getChannel().map(FileChannel.MapMode.READ_WRITE, 0, roundedNewSize)
-          _maxEntries = mmap.limit() / entrySize
-          mmap.position(position)
+
+          if (!keepUnmaped) {
+            mmap = raf.getChannel().map(FileChannel.MapMode.READ_WRITE, 0, roundedNewSize)
+            _maxEntries = mmap.limit() / entrySize
+            mmap.position(position)
+          }
+
           true
         } finally {
           CoreUtils.swallow(raf.close(), this)
@@ -189,9 +196,13 @@ abstract class AbstractIndex[K, V](@volatile var file: File, val baseOffset: Lon
    */
   def sizeInBytes = entrySize * _entries
 
-  /** Close the index */
+  /** Close the index. Unmap file in Windows, to be able to move/rename the folder */
   def close() {
-    trimToValidSize()
+    val unmap = OperatingSystem.IS_WINDOWS
+    //if file wasn't resized, unmap force on Windows
+    if(!resize(entrySize * _entries, unmap) && unmap) {
+      safeForceUnmap()
+    }
   }
 
   def closeHandler(): Unit = {
@@ -227,9 +238,13 @@ abstract class AbstractIndex[K, V](@volatile var file: File, val baseOffset: Lon
   }
 
   protected def safeForceUnmap(): Unit = {
-    try forceUnmap()
-    catch {
-      case t: Throwable => error(s"Error unmapping index $file", t)
+    if(mmap == null) {
+      info(s"Failed to unmap ${file.getAbsolutePath} because it is already unmapped.")
+    } else {
+      try forceUnmap()
+      catch {
+        case t: Throwable => error(s"Error unmapping index $file", t)
+      }
     }
   }
 
