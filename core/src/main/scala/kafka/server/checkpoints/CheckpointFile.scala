@@ -18,13 +18,12 @@ package kafka.server.checkpoints
 
 import java.io._
 import java.nio.charset.StandardCharsets
-import java.nio.file.{FileAlreadyExistsException, Files, Paths}
+import java.nio.file.{FileAlreadyExistsException, Files, Paths, Path, FileSystemException}
 
 import kafka.server.LogDirFailureChannel
 import kafka.utils.Logging
 import org.apache.kafka.common.errors.KafkaStorageException
 import org.apache.kafka.common.utils.Utils
-
 import scala.collection.{Seq, mutable}
 
 trait CheckpointFileFormatter[T]{
@@ -70,13 +69,38 @@ class CheckpointFile[T](val file: File,
           Utils.closeQuietly(fileOutputStream, tempPath.toString)
         }
 
-        Utils.atomicMoveWithFallback(tempPath, path)
+        moveSafe(tempPath, path);
       } catch {
         case e: IOException =>
           val msg = s"Error while writing to checkpoint file ${file.getAbsolutePath}"
           logDirFailureChannel.maybeAddOfflineLogDir(logDir, msg, e)
           throw new KafkaStorageException(msg, e)
       }
+    }
+  }
+
+  /**
+   * Try to move tempPath to path, move can fail on Windows if path is already in use. Prevent fatal error if move
+   * failed.
+   *
+   * @param tempPath
+   * @param path
+   */
+  def moveSafe(tempPath: Path,
+               path: Path) {
+    try {
+      Utils.atomicMoveWithFallback(tempPath, path)
+    } catch {
+      case e: FileSystemException =>
+        warn(s"Failed to write to the checkpoint file ${path.toString}. Trying to delete it first.", e)
+        try {
+          Files.deleteIfExists(path)
+          Utils.atomicMoveWithFallback(tempPath, path)
+        } catch {
+          case e: IOException =>
+            warn(s"Failed to delete existing file ${path.toString}")
+            error(s"Filed to create ${path.toString}, the file already exists and it is in use", e)
+        }
     }
   }
 
